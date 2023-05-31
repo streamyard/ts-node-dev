@@ -2,6 +2,7 @@ import { fork, ChildProcess } from 'child_process'
 import chokidar from 'chokidar'
 import fs from 'fs'
 import readline from 'readline'
+import path from 'path'
 
 const kill = require('tree-kill')
 
@@ -52,12 +53,25 @@ export const runDev = (
   // Run ./dedupe.js as preload script
   if (cfg.dedupe) process.env.NODE_DEV_PRELOAD = __dirname + '/dedupe'
 
-  function initWatcher() {
+  function initWatcher({
+    isCliPathWatcher,
+  }: { isCliPathWatcher?: boolean } = {}) {
     const watcher = chokidar.watch([], {
       usePolling: opts.poll,
       interval: parseInt(opts.interval) || undefined,
+      // When watching parent directories of required files, prevent recursion with depth: 0.
+      // Use the default depth when watching explicitly provided paths from the CLI.
+      depth: isCliPathWatcher ? undefined : 0,
     })
-    watcher.on('change', restart)
+    watcher.on('change', (path) => {
+      restart(path, { isCliPathWatcher })
+    })
+
+    if (!isCliPathWatcher) {
+      watcher.on('unlink', (path) => {
+        restart(path, { isDeletion: true })
+      })
+    }
 
     watcher.on('fallback', function (limit) {
       log.warn(
@@ -70,7 +84,17 @@ export const runDev = (
     })
     return watcher
   }
+
+  // Keep track of which files are required by node, so we can ignore others
+  // when watching directories. For example, we want to restart when changing
+  // src/foo.ts but not src/foo.spec.ts. We watch the entire src/ directory
+  // to get around a Docker issue, so we need to filter out unrequired files.
+  let requiredFiles: Record<string, boolean> = {}
   let watcher = initWatcher()
+  // When explicit paths are additionally provided by the --watch [paths] CLI option,
+  // we do not want to filter out unrequired files' changes. Create a separate watcher
+  // for these.
+  let cliPathWatcher = initWatcher({ isCliPathWatcher: true })
 
   let starting = false
 
@@ -83,7 +107,7 @@ export const runDev = (
     })
     rl.on('line', (line: string) => {
       if (line.trim() === 'rs') {
-        restart('', true)
+        restart('', { isManualRestart: true })
       }
     })
   }
@@ -103,10 +127,12 @@ export const runDev = (
    */
   let compileReqWatcher: chokidar.FSWatcher
   function start() {
+    requiredFiles = {}
+
     if (cfg.clear) process.stdout.write('\u001bc')
 
     for (const watched of (opts.watch || '').split(',')) {
-      if (watched) watcher.add(watched)
+      if (watched) cliPathWatcher.add(watched)
     }
 
     let cmd = nodeArgs.concat(wrapper, script, scriptArgs)
@@ -179,6 +205,7 @@ export const runDev = (
     }
 
     if (compiler.tsConfigPath) {
+      requiredFiles[compiler.tsConfigPath] = true
       watcher.add(compiler.tsConfigPath)
     }
 
@@ -190,8 +217,11 @@ export const runDev = (
         cfg.ignore.some(isRegExpMatch(required))
 
       if (!isIgnored && (cfg.deps === -1 || getLevel(required) <= cfg.deps)) {
+        requiredFiles[required] = true
         log.debug(required, 'added to watcher')
-        watcher.add(required)
+        // Individual file watchers have issues in Docker containers.
+        // When not using polling, watch parent directories instead.
+        watcher.add(opts.poll ? required : path.dirname(required))
       }
     })
 
@@ -229,19 +259,37 @@ export const runDev = (
     }
   }
 
-  function restart(file: string, isManualRestart?: boolean) {
+  function restart(
+    file: string,
+    {
+      isCliPathWatcher,
+      isDeletion,
+      isManualRestart,
+    }: {
+      isCliPathWatcher?: boolean
+      isDeletion?: boolean
+      isManualRestart?: boolean
+    } = {}
+  ) {
     if (file === compiler.tsConfigPath) {
       notify('Reinitializing TS compilation', '')
       compiler.init()
     }
-    compiler.clearErrorCompile()
 
     if (isManualRestart === true) {
       notify('Restarting', 'manual restart from user')
-    } else {
+    } else if (isCliPathWatcher || requiredFiles[file]) {
       notify('Restarting', file + ' has been modified')
+    } else {
+      log.debug('Ignoring file change', file)
+      return
     }
-    compiler.compileChanged(file)
+
+    compiler.clearErrorCompile()
+
+    if (!isDeletion) {
+      compiler.compileChanged(file)
+    }
     if (starting) {
       log.debug('Already starting')
       return
@@ -251,6 +299,8 @@ export const runDev = (
 
     watcher.close()
     watcher = initWatcher()
+    cliPathWatcher.close()
+    cliPathWatcher = initWatcher({ isCliPathWatcher: true })
     starting = true
     if (child) {
       log.debug('Child is still running, restart upon exit')
